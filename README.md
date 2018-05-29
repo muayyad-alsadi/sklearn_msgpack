@@ -32,3 +32,6 @@ it's very easy to add more
 
 ## Performance
 
+We have seen more than 25x faster loading an `MLPClassifier`
+and 150x faster loading for `TfidfVectorizer`
+
