@@ -3,6 +3,8 @@ import scipy.sparse as sp
 
 import msgpack
 
+from functools import partial
+
 from sklearn.neural_network import MLPClassifier
 from sklearn.neural_network._base import ACTIVATIONS
 
@@ -34,6 +36,7 @@ types_map['csr_matrix'] = lambda kw: sp.csr_matrix(
 types_map['tuple']=tuple
 
 simplify_type = {
+    'NoneType': lambda i: None,
     'int32': lambda i: int(i),
     'int64': lambda i: int(i),
     'uint32': lambda i: int(i),
@@ -43,24 +46,41 @@ simplify_type = {
     'ndarray': lambda i: i.tolist(),
     'tuple': lambda i: list(i),
     'csr_matrix': lambda i: {
+        'class_name': 'csr_matrix',
         'shape': list(i.shape),
         'arg1': [i.data.tolist() , i.indices.tolist(), i.indptr.tolist()], 
         'dtype': i.dtype.name,
     },
 }
 
-def get_value_n_type(value):
+def add_simplifier(name):
+    def decorator(function):
+        simplify_type[name]=function
+        return function
+    return decorator
+
+def add_type(name):
+    def decorator(function):
+        types_map[name]=function
+        return function
+    return decorator
+
+def get_value_n_type(value, **kw):
     type_name = type(value).__name__
     if type_name == 'type':
-        return value.__name__, 'type'
+        return value.__name__, type_name
+    elif type_name == 'NoneType':
+        return value, 'NoneType'
     if type_name in simplify_type:
-        return simplify_type[type_name](value), type_name
+        return simplify_type[type_name](value, **kw), type_name
     return value, None
 
-def value_to_type(value, type_name=None):
+def value_to_type(value, type_name=None, kwargs={}):
+    if type_name is None and isinstance(value, dict):
+        type_name = value.get('class_name')
     if type_name is None: return value
     if type_name not in types_map: return value
-    return types_map[type_name](value)
+    return types_map[type_name](value, **kwargs)
 
 def get_simplified_params(params, types):
     ret={}
@@ -74,43 +94,9 @@ def load_simplified_params(dst, params, types):
     for key, value in params.items():
         type_name = types.get(key)
         value = value_to_type(value, type_name)
-        print "setting ", key
         setattr(dst, key, value)
 
-
-def load_x_y_csv(fd):
-    X=[]
-    Y=[]
-    for line in fd.readlines():
-        parts=line.strip().split(',')
-        y=int(parts[0])
-        Y.append(y)
-        x=[ float(part) for part in parts[1:] ]
-        X.append(x)
-    X=np.array(X)
-    Y=np.array(Y)
-    return X, Y
-
-def forward_pass(clf, X, to=None):
-    if to is None:
-        to = clf.n_layers_ - 1
-    activations = [X]
-    activations.extend([None for i in range(1, clf.n_layers_ - 1) ])
-    hidden_activation = ACTIVATIONS[clf.activation]
-    # Iterate over the hidden layers
-    for i in range(to):
-        activations[i + 1] = safe_sparse_dot(activations[i], clf.coefs_[i])
-        activations[i + 1] += clf.intercepts_[i]
-
-        # For the hidden layers
-        if (i + 1) != (clf.n_layers_ - 1):
-            activations[i + 1] = hidden_activation(activations[i + 1])
-        else:
-            output_activation = ACTIVATIONS[clf.out_activation_]
-            activations[i + 1] = output_activation(activations[i + 1])
-
-    return activations
-
+@add_simplifier('MLPClassifier')
 def mlp_get_params(src, keep_loss=True, keep_iter=True, keep_weights=True):
     ret={"class_name": src.__class__.__name__}
     params = src.get_params(True)
@@ -170,6 +156,7 @@ def mlp_load_params(dst, mlp_params, **kw):
     if hasattr(dst, '_optimizer'): del dst._optimizer
     return dst
 
+@add_type('MLPClassifier')
 def mlp_construct(mlp_params, **kw):
     dst = MLPClassifier()
     mlp_load_params(dst, mlp_params, **kw)
@@ -184,12 +171,7 @@ def mlp_construct(mlp_params, **kw):
 # np.array(  ).reshape( original_shape )
 
 
-def mlp_save(mlp, fd, **kw):
-    msgpack.dump(mlp_get_params(mlp, **kw), fd, default=lambda o: list(o))
-
-def mlp_load(fd, **kw):
-    return mlp_construct(msgpack.load(fd), **kw)
-
+@add_simplifier('TfidfTransformer')
 def tfidf_transformer_get_params(tfidf):
     types={}
     params = get_simplified_params(tfidf.get_params(), types)
@@ -210,12 +192,13 @@ def tfidf_transformer_load_params(dst, params, **kw):
         setattr(dst, key, value)
     return dst
 
+@add_type('TfidfTransformer')
 def tfidf_transformer_construct(params, **kw):
     dst = TfidfTransformer()
     tfidf_transformer_load_params(dst, params, **kw)
     return dst
 
-
+@add_simplifier('TfidfVectorizer')
 def tfidf_vectorizer_get_params(vectorizer, keep_stop_words=False):
     types={}
     params = get_simplified_params(vectorizer.get_params(), types)
@@ -242,33 +225,25 @@ def tfidf_vectorizer_load_params(dst, params, **kw):
         setattr(dst, key, value)
     return dst
 
+@add_type('TfidfVectorizer')
 def tfidf_vectorizer_construct(params, **kw):
     dst = TfidfVectorizer()
     tfidf_vectorizer_load_params(dst, params, **kw)
     return dst
 
-def tfidf_vectorizer_save(vectorizer, fd, **kw):
-    msgpack.dump(tfidf_vectorizer_get_params(vectorizer, **kw), fd, default=lambda o: list(o))
+def save(fd, instance, **kw):
+    simplified, typ = get_value_n_type(instance, **kw)
+    msgpack.dump(simplified, fd, default=lambda o: list(o))
 
-def tfidf_vectorizer_load(fd, **kw):
-    return tfidf_vectorizer_construct(msgpack.load(fd, encoding='utf-8'), **kw)
+def save_to_file(filename, instance, **kw):
+    with open(filename, "wb") as fd:
+        save(fd, instance, **kw)
 
-def generic_save(instance, fd, **kw):
-    if isinstance(instance, MLPClassifier):
-        mlp_save(instance, fd, **kw)
-    elif isinstance(instance, TfidfVectorizer):
-        tfidf_vectorizer_save(instance, fd, **kw)
-    else:
-        raise TypeError('only accepts MLPClassifier or TfidfVectorizer')
-
-def generic_load(fd, **kw):
+def load(fd, **kwargs):
     loaded = msgpack.load(fd, encoding='utf-8')
-    class_name = loaded.get('class_name')
-    if class_name == 'MLPClassifier':
-        print "loading MLPClassifier"
-        return mlp_construct(loaded, **kw)
-    elif class_name == 'TfidfVectorizer':
-        print "loading TfidfVectorizer"
-        return tfidf_vectorizer_construct(loaded, **kw)
-    else:
-        raise TypeError('only accepts MLPClassifier or TfidfVectorizer')
+    return value_to_type(loaded, kwargs=kwargs)
+
+def load_from_file(filename, **kw):
+    with open(filename, "rb") as fd:
+        return load(fd, **kw)
+
